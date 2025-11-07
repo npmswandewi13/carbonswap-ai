@@ -10,9 +10,16 @@ import cors from 'cors'
 app.use(cors())
 app.use(express.json())
 
-const client = new MongoClient(process.env.MONGODB_ATLAS_URI as string)
-
 async function startServer() {
+    // validate required envs at startup (fail fast)
+    const uri = process.env.MONGODB_ATLAS_URI;
+    if (!uri) {
+        console.error('Missing MONGODB_ATLAS_URI environment variable')
+        process.exit(1)
+    }
+
+    const client = new MongoClient(uri)
+
     try {
         await client.connect()
         await client.db('admin').command({ ping: 1 })

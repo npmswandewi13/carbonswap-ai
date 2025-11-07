@@ -13,6 +13,12 @@ import { MongoClient } from "mongodb"
 import { z } from "zod"
 import "dotenv/config"
 
+// ensure API key exists at module/runtime start (fail fast)
+if (!process.env.GOOGLE_API_KEY) {
+  throw new Error('Missing GOOGLE_API_KEY environment variable')
+}
+const GOOGLE_API_KEY: string = process.env.GOOGLE_API_KEY
+
 /**
  * retry helper for transient errors (rate limits)
  */
@@ -71,7 +77,7 @@ export async function callAgent(client: MongoClient, query: string, thread_id: s
 
           // instantiate embeddings & vector store (matches seed settings)
           const embeddingsClient = new GoogleGenerativeAIEmbeddings({
-            apiKey: process.env.GOOGLE_API_KEY,
+            apiKey: GOOGLE_API_KEY,
             modelName: "text-embedding-004",
           })
 
@@ -83,7 +89,7 @@ export async function callAgent(client: MongoClient, query: string, thread_id: s
           })
 
           // perform similarity search with retry
-          const rawResults = await retryWithBackoff(() => vectorStore.similaritySearchWithScore(query, n))
+          const rawResults: any[] = await retryWithBackoff(() => vectorStore.similaritySearchWithScore(query, n))
 
           // Normalize results to array of { id, score, source, summary, metadata }
           const normalized: Array<any> = []
@@ -92,8 +98,10 @@ export async function callAgent(client: MongoClient, query: string, thread_id: s
             let doc: any
             let score: number | null = null
             if (Array.isArray(r) && r.length >= 2) {
-              doc = r[0]
-              score = r[1]
+              // destructure tuple [document, score]
+              const [maybeDoc, maybeScore] = r
+              doc = maybeDoc
+              score = typeof maybeScore === 'number' ? maybeScore : null
             } else if (r?.document && r?.score !== undefined) {
               doc = r.document
               score = r.score
@@ -169,7 +177,7 @@ export async function callAgent(client: MongoClient, query: string, thread_id: s
       model: "gemini-2.5-flash",
       temperature: 0,
       maxRetries: 0,
-      apiKey: process.env.GOOGLE_API_KEY,
+      apiKey: GOOGLE_API_KEY,
     }).bindTools(tools)
 
     // Decision engine: LangGraph will route to tools when model issues tool_calls
