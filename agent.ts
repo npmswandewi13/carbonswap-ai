@@ -1,43 +1,45 @@
 // agent.ts
-import { GoogleGenerativeAIEmbeddings } from "@langchain/google-genai"
-import { ChatGoogleGenerativeAI } from "@langchain/google-genai"
-import { AIMessage, BaseMessage, HumanMessage } from "@langchain/core/messages"
-import { ChatPromptTemplate, MessagesPlaceholder } from "@langchain/core/prompts"
-import { StateGraph } from "@langchain/langgraph"
-import { Annotation } from "@langchain/langgraph"
-import { tool } from "@langchain/core/tools"
-import { ToolNode } from "@langchain/langgraph/prebuilt"
-import { MongoDBSaver } from "@langchain/langgraph-checkpoint-mongodb"
-import { MongoDBAtlasVectorSearch } from "@langchain/mongodb"
-import { MongoClient } from "mongodb"
-import { z } from "zod"
-import "dotenv/config"
-
-// ensure API key exists at module/runtime start (fail fast)
-if (!process.env.GOOGLE_API_KEY) {
-  throw new Error('Missing GOOGLE_API_KEY environment variable')
-}
-const GOOGLE_API_KEY: string = process.env.GOOGLE_API_KEY
+import { GoogleGenerativeAIEmbeddings } from "@langchain/google-genai";
+import { ChatGoogleGenerativeAI } from "@langchain/google-genai";
+import { AIMessage, BaseMessage, HumanMessage } from "@langchain/core/messages";
+import {
+  ChatPromptTemplate,
+  MessagesPlaceholder,
+} from "@langchain/core/prompts";
+import { StateGraph } from "@langchain/langgraph";
+import { Annotation } from "@langchain/langgraph";
+import { tool } from "@langchain/core/tools";
+import { ToolNode } from "@langchain/langgraph/prebuilt";
+import { MongoDBSaver } from "@langchain/langgraph-checkpoint-mongodb";
+import { MongoDBAtlasVectorSearch } from "@langchain/mongodb";
+import { MongoClient } from "mongodb";
+import { z } from "zod";
+import "dotenv/config";
 
 /**
  * retry helper for transient errors (rate limits)
  */
-async function retryWithBackoff<T>(fn: () => Promise<T>, maxRetries = 3): Promise<T> {
+async function retryWithBackoff<T>(
+  fn: () => Promise<T>,
+  maxRetries = 3
+): Promise<T> {
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
-      return await fn()
+      return await fn();
     } catch (err: any) {
-      const isRate = err?.status === 429 || err?.code === 429
+      const isRate = err?.status === 429 || err?.code === 429;
       if (isRate && attempt < maxRetries) {
-        const delay = Math.min(1000 * Math.pow(2, attempt), 30000)
-        console.log(`[retry] rate limit, sleeping ${delay}ms (attempt ${attempt})`)
-        await new Promise((r) => setTimeout(r, delay))
-        continue
+        const delay = Math.min(1000 * Math.pow(2, attempt), 30000);
+        console.log(
+          `[retry] rate limit, sleeping ${delay}ms (attempt ${attempt})`
+        );
+        await new Promise((r) => setTimeout(r, delay));
+        continue;
       }
-      throw err
+      throw err;
     }
   }
-  throw new Error("Max retries exceeded")
+  throw new Error("Max retries exceeded");
 }
 
 /**
@@ -46,18 +48,28 @@ async function retryWithBackoff<T>(fn: () => Promise<T>, maxRetries = 3): Promis
  * - query: user query string
  * - thread_id: conversation thread id (for persistence)
  */
-export async function callAgent(client: MongoClient, query: string, thread_id: string) {
+export async function callAgent(
+  client: MongoClient,
+  query: string,
+  thread_id: string
+) {
   try {
-    const dbName = "inventory_database"
-    const db = client.db(dbName)
-    const collection = db.collection("items")
+    // Validate API key exists
+    const apiKey = process.env.GOOGLE_API_KEY;
+    if (!apiKey) {
+      throw new Error("GOOGLE_API_KEY environment variable is required");
+    }
+
+    const dbName = "inventory_database";
+    const db = client.db(dbName);
+    const collection = db.collection("items");
 
     // State schema for LangGraph
     const GraphState = Annotation.Root({
       messages: Annotation<BaseMessage[]>({
         reducer: (x, y) => x.concat(y),
       }),
-    })
+    });
 
     /**
      * Tool: vector_search (named "vector_search")
@@ -68,83 +80,102 @@ export async function callAgent(client: MongoClient, query: string, thread_id: s
     const vectorSearchTool = tool(
       async ({ query, n = 6 }) => {
         try {
-          console.log(`[vector_search] query="${query}" n=${n}`)
+          console.log(`[vector_search] query="${query}" n=${n}`);
 
-          const total = await collection.countDocuments()
+          const total = await collection.countDocuments();
           if (total === 0) {
-            return JSON.stringify({ error: "empty_db", message: "No indexed documents found", count: 0 })
+            return JSON.stringify({
+              error: "empty_db",
+              message: "No indexed documents found",
+              count: 0,
+            });
           }
 
           // instantiate embeddings & vector store (matches seed settings)
           const embeddingsClient = new GoogleGenerativeAIEmbeddings({
-            apiKey: GOOGLE_API_KEY,
+            apiKey: apiKey,
             modelName: "text-embedding-004",
-          })
+          });
 
           const vectorStore = new MongoDBAtlasVectorSearch(embeddingsClient, {
             collection,
             indexName: "vector_index",
             textKey: "pageContent",
             embeddingKey: "embedding",
-          })
+          });
 
           // perform similarity search with retry
-          const rawResults: any[] = await retryWithBackoff(() => vectorStore.similaritySearchWithScore(query, n))
+          const rawResults = await retryWithBackoff(() =>
+            vectorStore.similaritySearchWithScore(query, n)
+          );
 
           // Normalize results to array of { id, score, source, summary, metadata }
-          const normalized: Array<any> = []
+          const normalized: Array<any> = [];
           for (const r of rawResults) {
-            // the library may return [doc, score] or { document, score }
-            let doc: any
-            let score: number | null = null
-            if (Array.isArray(r) && r.length >= 2) {
-              // destructure tuple [document, score]
-              const [maybeDoc, maybeScore] = r
-              doc = maybeDoc
-              score = typeof maybeScore === 'number' ? maybeScore : null
-            } else if (r?.document && r?.score !== undefined) {
-              doc = r.document
-              score = r.score
-            } else {
-              doc = r
-            }
+            // FIX: The library returns [doc, score] tuple - use array destructuring
+            const [doc, score] = r;
 
-            const meta = doc.metadata ?? {}
-            const source = meta.source ?? doc.source ?? "unknown"
+            const meta = doc.metadata ?? {};
+            const docAny = doc as any;
+
+            const source = meta.source ?? docAny.source ?? "unknown";
 
             // create friendly summary depending on source
-            let summary = ""
+            let summary = "";
             if (source === "dummyProjects" || meta.raw) {
               // prefer raw structured fields if available
-              const raw = meta.raw ?? doc.metadata?.raw ?? doc.raw ?? {}
-              const projectName = raw.projectName ?? raw.ProjectName ?? meta.projectName ?? doc.pageContent?.slice(0, 80)
-              const location = raw.location ?? raw.Location ?? meta.location
-              const price = raw.price ?? raw.Price
-              const sequestration = raw.carbonSequestration ?? raw.carbonSequestration ?? raw.sequestration
-              const stock = raw.stock ?? raw.Stock
-              summary = `Project: ${projectName}${location ? ` | Location: ${location}` : ""}${sequestration ? ` | Est. sequestration: ${sequestration}` : ""}${price ? ` | Price: ${price}` : ""}${stock ? ` | Stock: ${stock}` : ""}`
+              const raw = meta.raw ?? doc.metadata?.raw ?? docAny.raw ?? {};
+              const projectName =
+                raw.projectName ??
+                raw.ProjectName ??
+                meta.projectName ??
+                docAny.pageContent?.slice(0, 80);
+              const location = raw.location ?? raw.Location ?? meta.location;
+              const price = raw.price ?? raw.Price;
+              const sequestration =
+                raw.carbonSequestration ??
+                raw.carbonSequestration ??
+                raw.sequestration;
+              const stock = raw.stock ?? raw.Stock;
+              summary = `Project: ${projectName}${
+                location ? ` | Location: ${location}` : ""
+              }${
+                sequestration ? ` | Est. sequestration: ${sequestration}` : ""
+              }${price ? ` | Price: ${price}` : ""}${
+                stock ? ` | Stock: ${stock}` : ""
+              }`;
             } else if (source === "csv" || meta.row) {
-              const row = meta.row ?? doc.row ?? {}
-              const nama = row.nama_lokasi ?? row.nama_lokasi ?? row.name ?? doc.pageContent?.slice(0, 80)
-              const luas = row.luas_ha ?? row.luas ?? row.area
-              const karbon = row.karbon_terserap ?? row.karbon ?? row.carbon
-              const rating = row.rating_ulasan ?? row.rating
-              summary = `Location: ${nama}${luas ? ` | Area: ${luas} ha` : ""}${karbon ? ` | Carbon captured: ${karbon}` : ""}${rating ? ` | Rating: ${rating}` : ""}`
+              const row = meta.row ?? docAny.row ?? {};
+              const nama =
+                row.nama_lokasi ??
+                row.nama_lokasi ??
+                row.name ??
+                doc.pageContent?.slice(0, 80);
+              const luas = row.luas_ha ?? row.luas ?? row.area;
+              const karbon = row.karbon_terserap ?? row.karbon ?? row.carbon;
+              const rating = row.rating_ulasan ?? row.rating;
+              summary = `Location: ${nama}${luas ? ` | Area: ${luas} ha` : ""}${
+                karbon ? ` | Carbon captured: ${karbon}` : ""
+              }${rating ? ` | Rating: ${rating}` : ""}`;
             } else if (source === "markdown") {
               // use chunk title / first lines
-              const snippet = (doc.pageContent ?? "").split("\n").slice(0, 3).join(" ").trim()
-              summary = `Doc: ${snippet}`
+              const snippet = (doc.pageContent ?? "")
+                .split("\n")
+                .slice(0, 3)
+                .join(" ")
+                .trim();
+              summary = `Doc: ${snippet}`;
             } else {
-              summary = (doc.pageContent ?? "").slice(0, 150)
+              summary = (doc.pageContent ?? "").slice(0, 150);
             }
 
             normalized.push({
-              id: doc.metadata?._id ?? doc._id ?? meta._id,
+              id: doc.metadata?._id ?? docAny._id ?? meta._id,
               score,
               source,
               summary,
               full: doc,
-            })
+            });
           }
 
           return JSON.stringify({
@@ -152,10 +183,14 @@ export async function callAgent(client: MongoClient, query: string, thread_id: s
             searchType: "vector",
             query,
             count: normalized.length,
-          })
+          });
         } catch (err: any) {
-          console.error("[vector_search] error:", err)
-          return JSON.stringify({ error: "search_error", details: err?.message ?? String(err), query })
+          console.error("[vector_search] error:", err);
+          return JSON.stringify({
+            error: "search_error",
+            details: err?.message ?? String(err),
+            query,
+          });
         }
       },
       {
@@ -163,30 +198,33 @@ export async function callAgent(client: MongoClient, query: string, thread_id: s
         description:
           "Performs semantic search over carbon projects, locations, and documentation. Use when user asks about specific projects, locations, sequestration numbers, price/stock, or asks 'show me' type queries.",
         schema: z.object({
-          query: z.string().describe("Search query (project name, location, metric, etc.)"),
+          query: z
+            .string()
+            .describe("Search query (project name, location, metric, etc.)"),
           n: z.number().optional().default(6).describe("Max results to return"),
         }),
       }
-    )
+    );
 
-    const tools = [vectorSearchTool]
-    const toolNode = new ToolNode<typeof GraphState.State>(tools)
+    const tools = [vectorSearchTool];
+    const toolNode = new ToolNode<typeof GraphState.State>(tools);
 
     // Initialize the chat model and bind tools
     const model = new ChatGoogleGenerativeAI({
       model: "gemini-2.5-flash",
       temperature: 0,
       maxRetries: 0,
-      apiKey: GOOGLE_API_KEY,
-    }).bindTools(tools)
+      apiKey: apiKey,
+    }).bindTools(tools);
 
     // Decision engine: LangGraph will route to tools when model issues tool_calls
     function shouldContinue(state: typeof GraphState.State) {
-      const msgs = state.messages || []
-      const last = msgs[msgs.length - 1] as AIMessage | undefined
-      if (!last) return "__end__"
-      if ((last as any).tool_calls && (last as any).tool_calls.length) return "tools"
-      return "__end__"
+      const msgs = state.messages || [];
+      const last = msgs[msgs.length - 1] as AIMessage | undefined;
+      if (!last) return "__end__";
+      if ((last as any).tool_calls && (last as any).tool_calls.length)
+        return "tools";
+      return "__end__";
     }
 
     // Model call: system prompt instructs Swappy behaviour and when to use tool
@@ -215,16 +253,16 @@ Your capabilities:
 Current time: {time}`,
           ],
           new MessagesPlaceholder("messages"),
-        ])
+        ]);
 
         const formatted = await prompt.formatMessages({
           time: new Date().toISOString(),
           messages: state.messages,
-        })
+        });
 
-        const result = await model.invoke(formatted)
-        return { messages: [result] }
-      })
+        const result = await model.invoke(formatted);
+        return { messages: [result] };
+      });
     }
 
     // Build workflow graph
@@ -233,26 +271,27 @@ Current time: {time}`,
       .addNode("tools", toolNode)
       .addEdge("__start__", "agent")
       .addConditionalEdges("agent", shouldContinue)
-      .addEdge("tools", "agent")
+      .addEdge("tools", "agent");
 
     // persistence of conversation
-    const checkpointer = new MongoDBSaver({ client, dbName })
-    const app = workflow.compile({ checkpointer })
+    const checkpointer = new MongoDBSaver({ client, dbName });
+    const app = workflow.compile({ checkpointer });
 
     // invoke workflow with user's message
     const finalState = await app.invoke(
       { messages: [new HumanMessage(query)] },
       { recursionLimit: 12, configurable: { thread_id } }
-    )
+    );
 
-    const lastMsg = finalState.messages[finalState.messages.length - 1]
-    const response = (lastMsg && (lastMsg as any).content) || ""
-    console.log("[Swappy] response:", response)
-    return response
+    const lastMsg = finalState.messages[finalState.messages.length - 1];
+    const response = (lastMsg && (lastMsg as any).content) || "";
+    console.log("[Swappy] response:", response);
+    return response;
   } catch (err: any) {
-    console.error("[callAgent] error:", err)
-    if (err?.status === 429) throw new Error("Rate limited; try again later.")
-    if (err?.status === 401) throw new Error("Authentication error; check API key.")
-    throw new Error(`Agent error: ${err?.message ?? String(err)}`)
+    console.error("[callAgent] error:", err);
+    if (err?.status === 429) throw new Error("Rate limited; try again later.");
+    if (err?.status === 401)
+      throw new Error("Authentication error; check API key.");
+    throw new Error(`Agent error: ${err?.message ?? String(err)}`);
   }
 }

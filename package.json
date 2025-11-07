@@ -5,8 +5,8 @@
   "type": "module",
   "main": "index.js",
   "scripts": {
-    "dev": "npx ts-node index.ts",
-    "build": "tsc",
+    "dev": "npx ts-node index.js",
+    "build": "tsc --outDir ./dist",
     "start": "node dist/index.js",
     "seed": "npx ts-node seed-database.ts",
     "postinstall": "npm run build"
